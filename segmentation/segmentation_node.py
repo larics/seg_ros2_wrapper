@@ -41,8 +41,8 @@ class ImagePublisherSubscriber(Node):
         self.get_logger().info('Node has started.')
 
         # Paths
-        self.image_directory = '/home/karmela/ros2_ws/src/segmentation/pictures'
-        self.model_path = '/home/karmela/ros2_ws/src/segmentation/models/best_model_MobileNet.pt'
+        self.image_directory = '/path/to/pictures'
+        self.model_path = '/path/to/the/model.pt'
 
         self.image_files = [os.path.join(self.image_directory, f)
                             for f in os.listdir(self.image_directory)
