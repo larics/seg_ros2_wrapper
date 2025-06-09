@@ -1,38 +1,38 @@
 #!/usr/bin/env python3
 
 import os
-import random
 import numpy as np
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import Image
-from std_msgs.msg import String
 from PIL import Image as PILImage
 from cv_bridge import CvBridge
 import cv2
 import torch
 from torchvision import transforms
+from ament_index_python.packages import get_package_share_directory
 
-# Risk mapping definitions
+# Risk
 risk_map = {
-    0: 3, 1: 0, 2: 1, 3: 0, 4: 0, 5: 3, 6: 2, 7: 3, 8: 2, 9: 2,
-    10: 2, 11: 2, 12: 2, 13: 3, 14: 3, 15: 4, 16: 4, 17: 1,
-    18: 3, 19: 3, 20: 3, 21: 1, 22: 3, 23: 3,
+    0: 3, 1: 0, 2: 1, 3: 0, 4: 0, 5: 3, 6: 2, 7: 3, 8: 2, 9: 2, 10: 2,
+    11: 2, 12: 2, 13: 3, 14: 3, 15: 4, 16: 4, 17: 1, 18: 3, 19: 3,
+    20: 3, 21: 1, 22: 3, 23: 3,
 }
+
 risk_color_map = {
-    0: (0, 100, 0),       # Very Safe
-    1: (144, 238, 144),   # Safe
-    2: (255, 255, 0),     # Moderate
-    3: (255, 165, 0),     # Risky
-    4: (255, 0, 0),       # Dangerous
+    0: (0, 100, 0),
+    1: (144, 238, 144),
+    2: (255, 255, 0),
+    3: (255, 165, 0),
+    4: (255, 0, 0),
 }
 
-class ImagePublisherSubscriber(Node):
+class SegmentationNode(Node):
     def __init__(self):
-        super().__init__('image_publisher_subscriber')
+        super().__init__('segmentation_node')
 
-        self.subscription = self.create_subscription(
-            String, 'trigger_topic', self.listener_callback, 10)
+        self.image_subscription = self.create_subscription(
+            Image, '/world/risk/model/x500_depth_0/link/camera_link/sensor/IMX214/image', self.image_callback, 10)
         self.image_publisher = self.create_publisher(Image, 'image_topic', 10)
         self.segmentation_publisher = self.create_publisher(Image, 'segmentation_topic', 10)
         self.overlay_publisher = self.create_publisher(Image, 'overlay_topic', 10)
@@ -40,20 +40,21 @@ class ImagePublisherSubscriber(Node):
 
         self.get_logger().info('Node has started.')
 
-        # Paths
-        self.image_directory = '/path/to/pictures'
-        self.model_path = '/path/to/the/model.pt'
+        #self.package_path = get_package_share_directory('image')
+        model_path = '/root/uav_ws/src/segmentation-node/models/best_model_MobileNet.pt'
 
-        self.image_files = [os.path.join(self.image_directory, f)
-                            for f in os.listdir(self.image_directory)
-                            if f.lower().endswith(('.jpg', '.png'))]
-
-        if not self.image_files:
-            self.get_logger().warn(f"No images found in {self.image_directory}.")
-
-        self.model = torch.load(self.model_path, map_location=torch.device('cpu'))
-        self.model.eval()
-        self.get_logger().info('Model loaded successfully.')
+        try:
+            if torch.cuda.is_available():
+                self.exec_type = 'cuda'
+            else: 
+                self.exec_type = 'cpu'
+            self.model = torch.load(model_path, map_location=torch.device('{}'.format(self.exec_type)), weights_only=False)
+            self.model.eval()
+            self.model_loaded = True
+            self.get_logger().info('Model loaded successfully.')
+        except Exception as e:
+            self.model_loaded = False
+            self.get_logger().error(f"Failed to load model: {e}")
 
         self.preprocess = transforms.Compose([
             transforms.Resize([520, 520]),
@@ -62,23 +63,20 @@ class ImagePublisherSubscriber(Node):
                                  std=[0.229, 0.224, 0.225])
         ])
 
-    def listener_callback(self, msg):
-        self.get_logger().info(f'Received trigger: "{msg.data}"')
-
-        if not self.image_files:
-            self.get_logger().error('No images to process.')
+    def image_callback(self, msg):
+        if not self.model_loaded:
+            self.get_logger().warn("Model not loaded. Skipping image.")
             return
 
-        image_path = random.choice(self.image_files)
-        cv_image = cv2.imread(image_path)
-
-        if cv_image is None:
-            self.get_logger().error(f'Failed to read image from {image_path}')
-            return
+        self.get_logger().info('Received image.')
 
         try:
+            cv_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
             img_pil = PILImage.fromarray(cv2.cvtColor(cv_image, cv2.COLOR_BGR2RGB))
-            img_t = self.preprocess(img_pil).unsqueeze(0)
+            if self.exec_type == 'cuda':
+                img_t = self.preprocess(img_pil).unsqueeze(0).cuda()
+            else:
+                img_t = self.preprocess(img_pil).unsqueeze(0)
 
             with torch.no_grad():
                 outputs = self.model(img_t)
@@ -87,28 +85,26 @@ class ImagePublisherSubscriber(Node):
             segmented_image = draw_segmentation_map(output_tensor)
             risk_map_gray = generate_risk_map_from_labels(output_tensor)
             overlayed_image = image_overlay(cv_image, segmented_image)
-            overlayed_with_circle = highlight_low_risk_zone(risk_map_gray, overlayed_image)
+            overlayed_with_circle, best_center_scaled, best_center_unscaled = highlight_low_risk_zone(risk_map_gray, overlayed_image)
 
-            # Convert to ROS messages
-            ros_image = self.bridge.cv2_to_imgmsg(cv_image, "bgr8")
-            ros_segmented = self.bridge.cv2_to_imgmsg(segmented_image, "bgr8")
-            ros_overlayed = self.bridge.cv2_to_imgmsg(overlayed_with_circle, "bgr8")
+            if best_center_scaled and best_center_unscaled:
+                self.get_logger().info(f"Best center (risk map): {best_center_unscaled}")
+                self.get_logger().info(f"Best center (scaled to image): {best_center_scaled}")
 
-            # Publish all images
-            self.image_publisher.publish(ros_image)
-            self.segmentation_publisher.publish(ros_segmented)
-            self.overlay_publisher.publish(ros_overlayed)
+            self.image_publisher.publish(self.bridge.cv2_to_imgmsg(cv_image, "bgr8"))
+            self.segmentation_publisher.publish(self.bridge.cv2_to_imgmsg(segmented_image, "bgr8"))
+            self.overlay_publisher.publish(self.bridge.cv2_to_imgmsg(overlayed_with_circle, "bgr8"))
 
-            self.get_logger().info('Images published successfully.')
-
+            self.get_logger().info("Published segmented images.")
         except Exception as e:
-            self.get_logger().error(f'Error during image processing: {e}')
-
+            self.get_logger().error(f"Error processing image: {e}")
 
 
 def draw_segmentation_map(outputs):
-    labels = torch.argmax(outputs.squeeze(), dim=0).numpy()
-    red_map, green_map, blue_map = (np.zeros_like(labels, dtype=np.uint8) for _ in range(3))
+    labels = torch.argmax(outputs.squeeze().cpu(), dim=0).numpy()
+    red_map = np.zeros_like(labels).astype(np.uint8)
+    green_map = np.zeros_like(labels).astype(np.uint8)
+    blue_map = np.zeros_like(labels).astype(np.uint8)
 
     for label_num, risk_level in risk_map.items():
         idx = labels == label_num
@@ -118,8 +114,8 @@ def draw_segmentation_map(outputs):
     return np.stack([red_map, green_map, blue_map], axis=2)
 
 def generate_risk_map_from_labels(outputs):
-    labels = torch.argmax(outputs.squeeze(), dim=0).numpy()
-    risk_map_gray = np.zeros_like(labels, dtype=np.uint8)
+    labels = torch.argmax(outputs.squeeze().cpu(), dim=0).numpy()
+    risk_map_gray = np.zeros_like(labels).astype(np.uint8)
     for class_id, risk_level in risk_map.items():
         risk_map_gray[labels == class_id] = risk_level
     return risk_map_gray
@@ -151,12 +147,12 @@ def highlight_low_risk_zone(risk_map_gray, original_image, block_size=30, margin
         real_y = int(best_center[1] * (h_img / h_risk))
         cv2.circle(original_image, (real_x, real_y), 500, (255, 0, 0), 10)
         cv2.circle(original_image, (real_x, real_y), 5, (255, 0, 0), -1)
-    return original_image
-
+        return original_image, (real_x, real_y), best_center
+    return original_image, None, None
 
 def main(args=None):
     rclpy.init(args=args)
-    node = ImagePublisherSubscriber()
+    node = SegmentationNode()
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
@@ -167,4 +163,5 @@ def main(args=None):
 
 if __name__ == '__main__':
     main()
+
 
