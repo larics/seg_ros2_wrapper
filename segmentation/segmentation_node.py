@@ -68,7 +68,7 @@ class SegmentationNode(Node):
             self.get_logger().warn("Model not loaded. Skipping image.")
             return
 
-        self.get_logger().info('Received image.')
+        self.get_logger().debug('Received image.')
 
         try:
             cv_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
@@ -79,8 +79,11 @@ class SegmentationNode(Node):
                 img_t = self.preprocess(img_pil).unsqueeze(0)
 
             with torch.no_grad():
+                start_time = self.get_clock().now()
                 outputs = self.model(img_t)
                 output_tensor = outputs['out']
+                duration  = self.get_clock().now() - start_time
+                self.get_logger().info(f"Inference time: {duration.nanoseconds / 1e6} ms")
 
             segmented_image = draw_segmentation_map(output_tensor)
             risk_map_gray = generate_risk_map_from_labels(output_tensor)
@@ -88,14 +91,14 @@ class SegmentationNode(Node):
             overlayed_with_circle, best_center_scaled, best_center_unscaled = highlight_low_risk_zone(risk_map_gray, overlayed_image)
 
             if best_center_scaled and best_center_unscaled:
-                self.get_logger().info(f"Best center (risk map): {best_center_unscaled}")
-                self.get_logger().info(f"Best center (scaled to image): {best_center_scaled}")
+                self.get_logger().debug(f"Best center (risk map): {best_center_unscaled}")
+                self.get_logger().debug(f"Best center (scaled to image): {best_center_scaled}")
 
             self.image_publisher.publish(self.bridge.cv2_to_imgmsg(cv_image, "bgr8"))
             self.segmentation_publisher.publish(self.bridge.cv2_to_imgmsg(segmented_image, "bgr8"))
             self.overlay_publisher.publish(self.bridge.cv2_to_imgmsg(overlayed_with_circle, "bgr8"))
 
-            self.get_logger().info("Published segmented images.")
+            self.get_logger().debug("Published segmented images.")
         except Exception as e:
             self.get_logger().error(f"Error processing image: {e}")
 
